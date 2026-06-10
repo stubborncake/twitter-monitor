@@ -1,138 +1,218 @@
-"""Twitter 推文拉取模块 — 使用 Playwright 无头浏览器。
+"""Twitter 推文拉取模块 — 使用系统 Chromium + subprocess。
 
-不需要 Twitter API Key，通过浏览器自动化渲染 X.com 页面并提取推文。
+直接调用 chromium --headless --dump-dom 获取渲染后的 HTML，
+然后正则提取推文。避开 Playwright 的依赖和 asyncio 冲突。
 """
 
 import hashlib
+import html
+import json
 import logging
-import time
+import os
+import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Playwright 在模块级别懒加载（避免未安装时 import 报错）
-_browser = None
-_playwright = None
+CHROMIUM_BIN = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "chromium")
 
 
-def _get_browser():
-    """获取全局复用的浏览器实例（单例）。"""
-    global _browser, _playwright
-    if _browser is None:
-        from playwright.sync_api import sync_playwright
-        _playwright = sync_playwright().start()
-        _browser = _playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
-        )
-        logger.info("Playwright 浏览器已启动")
-    return _browser
+def _extract_tweets_from_html(page_html: str, username: str) -> list[dict]:
+    """从渲染后的 HTML 中提取推文。
 
-
-def fetch_tweets(
-    username: str,
-    max_results: int = 10,
-) -> list[dict]:
-    """拉取指定用户的最新推文。
-
-    Args:
-        username: Twitter/X 用户名（不含 @）。
-        max_results: 最多返回条数。
-
-    Returns:
-        推文列表，每条为 dict:
-          {"id": str, "text": str, "created_at": str, "author": str}
+    Twitter 在页面中内嵌了 __NEXT_DATA__ JSON，包含初始推文数据。
     """
     tweets = []
-    try:
-        browser = _get_browser()
-        page = browser.new_page(viewport={"width": 390, "height": 844})
 
-        # 访问用户主页
-        url = f"https://x.com/{username}"
-        logger.info(f"正在加载 {url} ...")
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    # 方法1：从 __NEXT_DATA__ JSON 提取（最可靠）
+    match = re.search(
+        r'<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*</script>',
+        page_html, re.DOTALL
+    )
+    if not match:
+        # X.com 新版用不同的变量名
+        match = re.search(
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(.*?)</script>',
+            page_html, re.DOTALL
+        )
 
-        # 等待推文渲染
-        page.wait_for_selector('[data-testid="tweetText"]', timeout=15000)
-        time.sleep(3)  # 等剩余 JS 加载完
-
-        # 提取推文
-        tweet_elements = page.query_selector_all('[data-testid="tweet"]')
-        for el in tweet_elements[:max_results]:
-            try:
-                # 推文文本
-                text_el = el.query_selector('[data-testid="tweetText"]')
-                if not text_el:
-                    continue
-                text = text_el.inner_text().strip()
-                if not text:
-                    continue
-
-                # 推文链接（含 ID）
-                link_el = el.query_selector('a[href*="/status/"]')
-                tweet_id = ""
-                if link_el:
-                    href = link_el.get_attribute("href") or ""
-                    # 从 /username/status/1234567890 提取 ID
-                    parts = href.split("/status/")
-                    if len(parts) == 2:
-                        tweet_id = parts[1].split("/")[0].split("?")[0]
-
-                if not tweet_id:
-                    tweet_id = _make_id(text)
-
-                # 时间
-                time_el = el.query_selector("time")
-                created_at = ""
-                if time_el:
-                    created_at = time_el.get_attribute("datetime") or ""
-
-                tweets.append({
-                    "id": tweet_id,
-                    "text": text,
-                    "created_at": created_at,
-                    "author": username,
-                })
-
-            except Exception as e:
-                logger.warning(f"提取单条推文失败: {e}")
-                continue
-
-        page.close()
-        logger.info(f"@{username} 抓取到 {len(tweets)} 条推文")
-
-    except Exception as e:
-        logger.error(f"抓取 @{username} 推文失败: {e}")
-        # 浏览器出问题时重置，下次重连
-        global _browser, _playwright
+    if match:
         try:
-            if _browser:
-                _browser.close()
-        except Exception:
+            data = json.loads(match.group(1))
+            # 遍历 JSON 查找推文数据
+            _walk_and_extract(data, username, tweets)
+        except (json.JSONDecodeError, KeyError):
             pass
-        _browser = None
-        _playwright = None
+
+    # 方法2：降级——直接从 HTML DOM 提取
+    if not tweets:
+        tweets = _extract_from_dom(page_html, username)
 
     return tweets
 
 
-def shutdown():
-    """关闭浏览器（程序退出时调用）。"""
-    global _browser, _playwright
+def _walk_and_extract(obj, username: str, tweets: list, depth: int = 0):
+    """递归遍历 JSON，查找 tweet 对象。"""
+    if depth > 20 or len(tweets) >= 20:
+        return
+
+    if isinstance(obj, dict):
+        # 检测推文对象：同时有 full_text 和 rest_id
+        if "full_text" in obj and "rest_id" in obj:
+            text = html.unescape(obj.get("full_text", ""))
+            tid = str(obj.get("rest_id", ""))
+            created_at = obj.get("created_at", "")
+            if text and tid:
+                tweets.append({
+                    "id": tid,
+                    "text": _clean_text(text),
+                    "created_at": created_at or "",
+                    "author": username,
+                })
+            return
+
+        if "legacy" in obj and isinstance(obj["legacy"], dict):
+            legacy = obj["legacy"]
+            if "full_text" in legacy:
+                tid = str(obj.get("rest_id", ""))
+                text = html.unescape(legacy.get("full_text", ""))
+                created_at = legacy.get("created_at", "")
+                if text and tid:
+                    tweets.append({
+                        "id": tid,
+                        "text": _clean_text(text),
+                        "created_at": created_at or "",
+                        "author": username,
+                    })
+                return
+
+        for v in obj.values():
+            _walk_and_extract(v, username, tweets, depth + 1)
+
+    elif isinstance(obj, list):
+        for item in obj[:50]:  # 限制遍历范围
+            _walk_and_extract(item, username, tweets, depth + 1)
+
+
+def _extract_from_dom(page_html: str, username: str) -> list[dict]:
+    """降级方案：从 HTML DOM 中正则提取推文文本。"""
+    tweets = []
+    # 匹配 data-testid="tweet" 区块
+    tweet_blocks = re.findall(
+        r'<article[^>]*data-testid="tweet"[^>]*>(.*?)</article>',
+        page_html, re.DOTALL
+    )
+
+    for block in tweet_blocks[:15]:
+        # 提取推文文本
+        text_match = re.search(
+            r'data-testid="tweetText"[^>]*>(.*?)</div>',
+            block, re.DOTALL
+        )
+        if not text_match:
+            continue
+
+        text = re.sub(r'<[^>]+>', '', text_match.group(1))
+        text = _clean_text(text)
+        if not text:
+            continue
+
+        # 提取推文 ID（从链接）
+        tid_match = re.search(r'/status/(\d+)', block)
+        tid = tid_match.group(1) if tid_match else _make_id(text)
+
+        tweets.append({
+            "id": tid,
+            "text": text,
+            "created_at": "",
+            "author": username,
+        })
+
+    return tweets
+
+
+def _clean_text(text: str) -> str:
+    """清理文本：去 HTML 实体、合并空白。"""
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def fetch_tweets(username: str, max_results: int = 10) -> list[dict]:
+    """拉取指定用户最新推文。
+
+    使用 chromium --headless --dump-dom 获取渲染页面，
+    从内嵌 JSON 中提取推文。
+    """
+    url = f"https://x.com/{username}"
+    logger.info(f"正在抓取 {url} ...")
+
     try:
-        if _browser:
-            _browser.close()
-    except Exception:
-        pass
-    _browser = None
-    _playwright = None
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            tmpfile = f.name
+
+        cmd = [
+            CHROMIUM_BIN,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-setuid-sandbox",
+            "--no-first-run",
+            "--no-zygote",
+            "--crash-dumps-dir=/tmp",
+            f"--dump-dom",
+            "--virtual-time-budget=8000",
+            f"--user-data-dir=/tmp/chromium-{username}",
+            url,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env={**os.environ, "DISPLAY": ""},
+        )
+
+        page_html = result.stdout
+
+        # 清理临时文件
+        Path(tmpfile).unlink(missing_ok=True)
+
+        if not page_html:
+            logger.error(f"Chromium 未返回内容，stderr: {result.stderr[:200]}")
+            return []
+
+        tweets = _extract_tweets_from_html(page_html, username)
+
+        # 去重
+        seen = set()
+        unique = []
+        for t in tweets:
+            if t["id"] not in seen:
+                seen.add(t["id"])
+                unique.append(t)
+
+        result_tweets = unique[:max_results]
+        logger.info(f"@{username} 抓取到 {len(result_tweets)} 条推文")
+        return result_tweets
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"抓取 @{username} 超时")
+        return []
+    except Exception as e:
+        logger.error(f"抓取 @{username} 失败: {e}")
+        return []
+
+
+def shutdown():
+    """清理（subprocess 模式无需做任何事）。"""
+    pass
 
 
 def _make_id(text: str) -> str:
-    """以内容哈希作为后备 ID。"""
     return hashlib.md5(text.encode()).hexdigest()[:16]
