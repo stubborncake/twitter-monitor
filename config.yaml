@@ -1,0 +1,26 @@
+# ── Twitter ──────────────────────────────────────────────
+# 使用 Playwright 无头浏览器抓取，无需 API Key
+twitter:
+  users:
+    - aleabitoreddit
+    - markminervini
+
+# ── 监控 ──────────────────────────────────────────────────
+monitor:
+  poll_interval_seconds: 3600   # 轮询间隔（秒），60分钟以适配 Free API 限额
+  tweets_per_user: 10           # 每次拉取每个用户的最新推文数
+
+# ── Bark 推送（Key 在 .env 中）────────────────────────────
+bark:
+  base_url: "https://api.day.app"
+
+# ── AI ───────────────────────────────────────────────────
+ai:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  min_confidence: 0.7           # 低于此置信度的不推送
+
+# ── 日志 ──────────────────────────────────────────────────
+log:
+  level: "INFO"
+  file: "data/monitor.log"

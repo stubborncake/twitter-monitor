@@ -1,0 +1,23 @@
+services:
+  monitor:
+    build: .
+    container_name: twitter-monitor
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      # 挂载源码（修改代码无需重建镜像）
+      - ./main.py:/app/main.py:ro
+      - ./fetcher.py:/app/fetcher.py:ro
+      - ./detector.py:/app/detector.py:ro
+      - ./notifier.py:/app/notifier.py:ro
+      - ./storage.py:/app/storage.py:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

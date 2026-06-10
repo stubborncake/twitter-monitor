@@ -1,0 +1,8 @@
+.env
+data/*.db
+data/*.log
+data/tweet_cursors.json
+__pycache__/
+.venv/
+data/*.db-shm
+data/*.db-wal
